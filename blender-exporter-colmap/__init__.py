@@ -2,13 +2,18 @@ import os
 import numpy as np
 from pathlib import Path
 import math
+import bpy
 import mathutils
 from mathutils import Vector
 from . ext.read_write_model import write_model, Camera, Image
 from bpy_extras.io_utils import ExportHelper
+from mathutils.bvhtree import BVHTree
 from bpy.props import StringProperty
 from bpy.types import CompositorNodeOutputFile
-import bpy
+
+import bmesh
+from bmesh.types import BMEdge, BMesh
+
 bl_info = {
     "name": "Scene exporter for colmap",
     "description": "Generates a dataset for colmap by exporting blender camera poses and rendering scene.",
@@ -172,19 +177,144 @@ def accumulate_points_from_image(depth_map_path: str, rgb_map_path: str, camera:
             rgb = rgb_array[y, x]
             colors.append(rgb)
 
+def merge_point_cloud_nearby_points(mesh_object: bpy.types.Object, distance_threshold: float = 0.05) -> None:
+    """Updates the existing point cloud mesh with merged vertices and colors."""
+    
+    bm = bmesh.new()
+    bm.from_mesh(mesh_object.data)
+
+    # Ensure the vertex lookup table is built
+    bm.verts.ensure_lookup_table()
+
+    color_layer = bm.loops.layers.color.get("Col")
+
+    if len(bm.verts) == 0:
+        raise ValueError("No vertices found in the mesh!")
+
+    print(f"Merging point cloud with {len(bm.verts)} vertices.")
+
+    # Store vertices to delete later
+    to_delete_vert_indices = set()
+    to_delete_verts = set()
+
+    # Loop over all vertices and compare to find nearby ones
+    for i, vert in enumerate(bm.verts):
+        if i in to_delete_vert_indices:
+            continue  # Skip vertices marked for deletion
+
+        # Initialize values for merging
+        nearby_vertices = [vert]
+        mean_location = vert.co.copy()
+        mean_color = Vector((0, 0, 0, 0))
+
+        # Compare with other vertices in the mesh
+        for j, other_vert in enumerate(bm.verts):
+            if j == i or j in to_delete_vert_indices:
+                continue
+
+            # Calculate distance between the two vertices
+            if (vert.co - other_vert.co).length <= distance_threshold:
+                nearby_vertices.append(other_vert)
+                mean_location += other_vert.co
+
+                # Accumulate color values
+                for loop in other_vert.link_loops:
+                    mean_color += Vector(loop[color_layer])
+
+                # Mark the other vertex for deletion
+                to_delete_vert_indices.add(j)
+                to_delete_verts.add(bm.verts[j])
+        
+        if len(nearby_vertices) == 0:
+            continue
+
+        # Compute the average position and color
+        new_location = mean_location / len(nearby_vertices)
+        new_color = mean_color / len(nearby_vertices)
+
+        # Update the main vertex to the averaged location and color
+        vert.co = new_location
+
+        for loop in vert.link_loops:
+            loop[color_layer] = new_color
+    bmesh.ops.delete(bm, geom=list(to_delete_verts), context='VERTS')
+
+    # Ensure the lookup table is rebuilt after removing vertices
+    bm.verts.ensure_lookup_table()
+
+    print(f"Point cloud merged with {len(bm.verts)} vertices remaining.")
+
+    # Write the updated BMesh back to the original mesh
+    bm.to_mesh(mesh_object.data)
+    mesh_object.data.update()
+
+    bm.free()
+
+def bvh_merge_point_cloud_nearby_points(mesh_object: bpy.types.Object, distance_threshold: float = 0.1) -> None:
+    """DEPRECATED. Doesn't work without faces. Updates the existing point cloud mesh with new vertices and colors."""
+    
+    bm = bmesh.new()
+    bm.from_mesh(mesh_object.data)
+
+    # Ensure the vertex lookup table is built
+    bm.verts.ensure_lookup_table()
+
+    color_layer = bm.loops.layers.color.get("Col")
+
+    if len(bm.verts) == 0:
+        raise ValueError("No vertices found in the mesh!")
+
+    print(f"Merging point cloud with {len(bm.verts)} vertices.")
+
+    bvh = BVHTree.FromBMesh(bm)
+
+    to_delete_vert_indices = []
+    for vert in bm.verts:
+        #Returns a list of tuples (Vector location, Vector normal, int index, float distance),
+        nearest_objects = bvh.find_nearest_range(vert.co, distance_threshold)
+
+        if len(nearest_objects) == 0:
+            continue
+
+        mean_location = Vector((0,0,0))
+        mean_color = Vector((0,0,0,0))
+        # Loop over the nearest vertices found
+        for (location, normal, index, distance) in nearest_objects:
+            nearest_vert = bm.verts[index]
+            to_delete_vert_indices.append(index)
+
+            mean_location += nearest_vert.co
+
+            # Loop over all loops connected to the vertex and assign color
+            for loop in nearest_vert.link_loops:
+                mean_color += loop[color_layer].color
+
+        vert.co = mean_location / len(nearest_objects)
+
+        for loop in vert.link_loops:
+            loop[color_layer] = mean_color / len(nearest_objects)
+
+    for index in sorted(to_delete_vert_indices, reverse=True):
+        bm.verts.remove(bm.verts[index])
+
+    bm.verts.ensure_lookup_table()
+    print(f"Point cloud merged with {len(bm.verts)} vertices.")
+
+    bm.to_mesh(mesh_object.data)
+    mesh_object.data.update()
+
+    bm.free()
+
 def create_point_cloud_after_accumulation(vertices: list, colors: list) -> None:
     """Creates the point cloud mesh after all points have been accumulated."""
     
-    # Create the point cloud mesh
     mesh_object = create_point_cloud(vertices, colors)
 
-    # Create an unlit emission shader for the point cloud
     emission_mat = create_emission_material(mesh_object)
 
-    # Add geometry nodes to make points visible in EEVEE
     add_geometry_nodes(mesh_object, emission_mat)
-
-    print(f"Final point cloud generated with {len(vertices)} points.")
+    
+    merge_point_cloud_nearby_points(mesh_object)
 
 class BlenderExporterForColmap(bpy.types.Operator, ExportHelper):
 
@@ -306,8 +436,6 @@ class BlenderExporterForColmap(bpy.types.Operator, ExportHelper):
                 if file.endswith(".exr"):
                     full_path = os.path.join(root, file)
                     temp_exr_files.append(full_path)
-                    print(f"Found depth map at: {full_path}") 
-
 
         # Initialize shared lists for vertices and colors
         vertices = []
