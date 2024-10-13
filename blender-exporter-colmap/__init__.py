@@ -41,12 +41,8 @@ def load_depth_and_rgb(depth_map_path: str, rgb_map_path: str) -> tuple[np.ndarr
 
     return depth_array, rgb_array, render_width, render_height
 
-def screen_to_camera_plane(x: float, y: float, cam: bpy.types.Object, width: int, height: int) -> tuple[float, float, float]:
-    """Projects 2D screen coordinates onto a flat plane in front of the camera, using FOV for the projection."""
-    
-    # Get the camera's FOV in degrees from the UI (check for 'FOV' mode)
-    if cam.data.type != 'PERSP' or cam.data.lens_unit != 'FOV':
-        raise ValueError("Camera must be set to perspective mode with Field of View")
+def screen_to_camera_plane(x: float, y: float, z_depth: float, cam: bpy.types.Object, width: int, height: int) -> tuple[float, float, float]:
+    """Projects 2D screen coordinates onto the camera's projection plane in 3D space, using depth values."""
 
     # Convert 2D screen coordinates to normalized device coordinates (NDC) [-1, 1]
     ndc_x = (x / width) * 2 - 1
@@ -56,13 +52,13 @@ def screen_to_camera_plane(x: float, y: float, cam: bpy.types.Object, width: int
     half_fov = cam.data.angle / 2
     tan_half_fov = math.tan(half_fov)
 
-    # Calculate camera space coordinates for X and Y using the FOV and aspect ratio
+    # Calculate camera space coordinates for X and Y using the FOV, aspect ratio, and depth
     aspect_ratio = width / height
-    camera_x = ndc_x * tan_half_fov  # Scaling X by the tangent of half-FOV
-    camera_y = ndc_y * tan_half_fov / aspect_ratio  # Y is scaled by the aspect ratio
+    camera_x = ndc_x * z_depth * tan_half_fov  # Scale by z_depth to account for distance
+    camera_y = ndc_y * z_depth * tan_half_fov / aspect_ratio  # Y is scaled by the aspect ratio
 
-    # Z-coordinate is fixed for the flat plane at a distance of 1 unit
-    camera_z = -1
+    # Z-coordinate is based on the depth value
+    camera_z = -z_depth  # Depth is along the negative Z-axis in camera space
 
     # Transform from camera space to world space
     camera_coords = Vector((camera_x, camera_y, camera_z))
@@ -152,18 +148,11 @@ def create_emission_material(mesh_object: bpy.types.Object) -> None:
 
     return mat
 
-def create_point_cloud_from_image(depth_map_path: str, rgb_map_path: str) -> None:
-    """Creates a point cloud from a depth and RGB image projected from the camera."""
+def accumulate_points_from_image(depth_map_path: str, rgb_map_path: str, camera: bpy.types.Object, vertices: list, colors: list) -> None:
+    """Accumulates points and colors from a depth and RGB image projected from the camera into shared lists."""
     
     # Load depth and RGB data
     depth_array, rgb_array, render_width, render_height = load_depth_and_rgb(depth_map_path, rgb_map_path)
-
-    # Get the active camera
-    camera = bpy.context.scene.camera
-
-    # List to store vertices and colors
-    vertices = []
-    colors = []
 
     # Iterate over every pixel and project to the camera plane
     for y in range(render_height):
@@ -176,13 +165,16 @@ def create_point_cloud_from_image(depth_map_path: str, rgb_map_path: str) -> Non
                 continue
 
             # Project the pixel to 3D coordinates on the camera's projection plane
-            point_3d = screen_to_camera_plane(x, y, camera, render_width, render_height)
+            point_3d = screen_to_camera_plane(x, y, z_depth, camera, render_width, render_height)
             vertices.append(point_3d)
 
             # Get the RGB values for this pixel and store them
             rgb = rgb_array[y, x]
             colors.append(rgb)
 
+def create_point_cloud_after_accumulation(vertices: list, colors: list) -> None:
+    """Creates the point cloud mesh after all points have been accumulated."""
+    
     # Create the point cloud mesh
     mesh_object = create_point_cloud(vertices, colors)
 
@@ -192,8 +184,7 @@ def create_point_cloud_from_image(depth_map_path: str, rgb_map_path: str) -> Non
     # Add geometry nodes to make points visible in EEVEE
     add_geometry_nodes(mesh_object, emission_mat)
 
-    print(f"Point cloud generated with {len(vertices)} points.")
-
+    print(f"Final point cloud generated with {len(vertices)} points.")
 
 class BlenderExporterForColmap(bpy.types.Operator, ExportHelper):
 
@@ -317,16 +308,23 @@ class BlenderExporterForColmap(bpy.types.Operator, ExportHelper):
                     temp_exr_files.append(full_path)
                     print(f"Found depth map at: {full_path}") 
 
+
+        # Initialize shared lists for vertices and colors
+        vertices = []
+        colors = []
+
         for idx, cam in enumerate(sorted_cameras):
             camera_id = idx+1
             depth_map_file = next((i for i in temp_exr_files if f"{cam.name_full}_depth" in i), None)
             rgb_map_file = os.path.join(images_dir, f'{cam.name_full}.jpg') 
             if depth_map_file is None:
-                continue
+                continue  
 
-            create_point_cloud_from_image(depth_map_file, rgb_map_file)
+            # Accumulate points and colors from the current image
+            accumulate_points_from_image(depth_map_file, rgb_map_file, cam, vertices, colors)
 
-
+        create_point_cloud_after_accumulation(vertices, colors)
+        
         write_model(cameras, images, {}, str(output_dir), output_format)
         yield 100.0
 
