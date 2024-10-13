@@ -10,6 +10,7 @@ from bpy_extras.io_utils import ExportHelper
 from mathutils.bvhtree import BVHTree
 from bpy.props import StringProperty
 from bpy.types import CompositorNodeOutputFile
+import random
 
 import bmesh
 from bmesh.types import BMEdge, BMesh
@@ -177,8 +178,26 @@ def accumulate_points_from_image(depth_map_path: str, rgb_map_path: str, camera:
             rgb = rgb_array[y, x]
             colors.append(rgb)
 
-def merge_point_cloud_nearby_points(mesh_object: bpy.types.Object, distance_threshold: float = 0.05) -> None:
-    """Updates the existing point cloud mesh with merged vertices and colors."""
+def get_bounding_box(mesh_object):
+    """Returns the min and max coordinates of the mesh's bounding box."""
+    vertices = [v.co for v in mesh_object.data.vertices]
+    min_bound = Vector((min(v.x for v in vertices), 
+                        min(v.y for v in vertices), 
+                        min(v.z for v in vertices)))
+    max_bound = Vector((max(v.x for v in vertices), 
+                        max(v.y for v in vertices), 
+                        max(v.z for v in vertices)))
+    return min_bound, max_bound
+
+def hash_point(point, min_bound, grid_resolution, cell_size):
+    """Converts a 3D point into a grid cell coordinate based on the bounding box and grid resolution."""
+    relative_pos = point - min_bound  # Shift point relative to bounding box min corner
+    return (int(relative_pos.x // cell_size.x),
+            int(relative_pos.y // cell_size.y),
+            int(relative_pos.z // cell_size.z))
+
+def merge_point_cloud_nearby_points(mesh_object: bpy.types.Object, grid_resolution: int = 128, distance_threshold: float = 0.01) -> None:
+    """Updates the existing point cloud mesh with merged vertices and colors using grid-based spatial hashing."""
     
     bm = bmesh.new()
     bm.from_mesh(mesh_object.data)
@@ -193,128 +212,118 @@ def merge_point_cloud_nearby_points(mesh_object: bpy.types.Object, distance_thre
 
     print(f"Merging point cloud with {len(bm.verts)} vertices.")
 
+    # Get bounding box of the mesh
+    min_bound, max_bound = get_bounding_box(mesh_object)
+
+    # Calculate the total size of the bounding box in each dimension
+    box_size = max_bound - min_bound
+
+    # Calculate cell size based on grid resolution
+    cell_size = Vector((box_size.x / grid_resolution,
+                        box_size.y / grid_resolution,
+                        box_size.z / grid_resolution))
+
+    # Create the spatial hash grid
+    grid = {}
+
+    # Populate the grid with vertices
+    for vert in bm.verts:
+        cell = hash_point(vert.co, min_bound, grid_resolution, cell_size)
+        if cell not in grid:
+            grid[cell] = []
+        grid[cell].append(vert)
+
     # Store vertices to delete later
-    to_delete_vert_indices = set()
     to_delete_verts = set()
 
+    # Function to get neighboring grid cells (3x3x3 surrounding cells)
+    def get_nearby_cells(cell):
+        for dx in range(-1, 2):
+            for dy in range(-1, 2):
+                for dz in range(-1, 2):
+                    yield (cell[0] + dx, cell[1] + dy, cell[2] + dz)
+
     # Loop over all vertices and compare to find nearby ones
-    for i, vert in enumerate(bm.verts):
-        if i in to_delete_vert_indices:
+    for vert in bm.verts:
+        if vert in to_delete_verts:
             continue  # Skip vertices marked for deletion
 
-        # Initialize values for merging
-        nearby_vertices = [vert]
+        # Get the cell the vertex is in
+        cell = hash_point(vert.co, min_bound, grid_resolution, cell_size)
+
         mean_location = vert.co.copy()
         mean_color = Vector((0, 0, 0, 0))
 
-        # Compare with other vertices in the mesh
-        for j, other_vert in enumerate(bm.verts):
-            if j == i or j in to_delete_vert_indices:
-                continue
+        nearby_vertices = [vert]  # Include the current vertex itself
 
-            # Calculate distance between the two vertices
-            if (vert.co - other_vert.co).length <= distance_threshold:
-                nearby_vertices.append(other_vert)
-                mean_location += other_vert.co
-
-                # Accumulate color values
-                for loop in other_vert.link_loops:
-                    mean_color += Vector(loop[color_layer])
-
-                # Mark the other vertex for deletion
-                to_delete_vert_indices.add(j)
-                to_delete_verts.add(bm.verts[j])
-        
-        if len(nearby_vertices) == 0:
-            continue
-
-        # Compute the average position and color
-        new_location = mean_location / len(nearby_vertices)
-        new_color = mean_color / len(nearby_vertices)
-
-        # Update the main vertex to the averaged location and color
-        vert.co = new_location
-
+        # Accumulate the color of the current vertex
         for loop in vert.link_loops:
-            loop[color_layer] = new_color
+            mean_color += Vector(loop[color_layer])
+
+        # Look for nearby vertices in the surrounding cells
+        for nearby_cell in get_nearby_cells(cell):
+            if nearby_cell not in grid:
+                continue
+            for other_vert in grid[nearby_cell]:
+                if other_vert == vert or other_vert in to_delete_verts:
+                    continue
+
+                # Check if the vertex is within the distance threshold
+                if (vert.co - other_vert.co).length <= distance_threshold:
+                    nearby_vertices.append(other_vert)
+                    mean_location += other_vert.co
+
+                    # Accumulate color
+                    for loop in other_vert.link_loops:
+                        mean_color += Vector(loop[color_layer])
+
+                    # Mark the other vertex for deletion
+                    to_delete_verts.add(other_vert)
+
+        # Only merge if there are valid nearby vertices
+        if len(nearby_vertices) > 1:
+            # Compute the average position and color
+            new_location = mean_location / len(nearby_vertices)
+            new_color = mean_color / len(nearby_vertices)
+
+            # Update the main vertex to the averaged location and color
+            vert.co = new_location
+
+            for loop in vert.link_loops:
+                loop[color_layer] = new_color
+
+    # Remove all vertices marked for deletion
     bmesh.ops.delete(bm, geom=list(to_delete_verts), context='VERTS')
 
-    # Ensure the lookup table is rebuilt after removing vertices
     bm.verts.ensure_lookup_table()
-
-    print(f"Point cloud merged with {len(bm.verts)} vertices remaining.")
-
+    verts_total = len(bm.verts)
     # Write the updated BMesh back to the original mesh
     bm.to_mesh(mesh_object.data)
     mesh_object.data.update()
 
     bm.free()
 
-def bvh_merge_point_cloud_nearby_points(mesh_object: bpy.types.Object, distance_threshold: float = 0.1) -> None:
-    """DEPRECATED. Doesn't work without faces. Updates the existing point cloud mesh with new vertices and colors."""
-    
-    bm = bmesh.new()
-    bm.from_mesh(mesh_object.data)
+    print(f"Point cloud merged with {verts_total} vertices remaining.")
 
-    # Ensure the vertex lookup table is built
-    bm.verts.ensure_lookup_table()
-
-    color_layer = bm.loops.layers.color.get("Col")
-
-    if len(bm.verts) == 0:
-        raise ValueError("No vertices found in the mesh!")
-
-    print(f"Merging point cloud with {len(bm.verts)} vertices.")
-
-    bvh = BVHTree.FromBMesh(bm)
-
-    to_delete_vert_indices = []
-    for vert in bm.verts:
-        #Returns a list of tuples (Vector location, Vector normal, int index, float distance),
-        nearest_objects = bvh.find_nearest_range(vert.co, distance_threshold)
-
-        if len(nearest_objects) == 0:
-            continue
-
-        mean_location = Vector((0,0,0))
-        mean_color = Vector((0,0,0,0))
-        # Loop over the nearest vertices found
-        for (location, normal, index, distance) in nearest_objects:
-            nearest_vert = bm.verts[index]
-            to_delete_vert_indices.append(index)
-
-            mean_location += nearest_vert.co
-
-            # Loop over all loops connected to the vertex and assign color
-            for loop in nearest_vert.link_loops:
-                mean_color += loop[color_layer].color
-
-        vert.co = mean_location / len(nearest_objects)
-
-        for loop in vert.link_loops:
-            loop[color_layer] = mean_color / len(nearest_objects)
-
-    for index in sorted(to_delete_vert_indices, reverse=True):
-        bm.verts.remove(bm.verts[index])
-
-    bm.verts.ensure_lookup_table()
-    print(f"Point cloud merged with {len(bm.verts)} vertices.")
-
-    bm.to_mesh(mesh_object.data)
-    mesh_object.data.update()
-
-    bm.free()
+def randomize_order(vertices: list, colors: list) -> tuple:
+    """Randomizes the order of vertices and their corresponding colors."""
+    combined = list(zip(vertices, colors))  # Combine vertices and colors to keep their correspondence
+    random.shuffle(combined)  # Shuffle the combined list
+    vertices, colors = zip(*combined)  # Unzip back into separate lists
+    return list(vertices), list(colors)
 
 def create_point_cloud_after_accumulation(vertices: list, colors: list) -> None:
     """Creates the point cloud mesh after all points have been accumulated."""
     
+    vertices, colors = randomize_order(vertices, colors)
+    
     mesh_object = create_point_cloud(vertices, colors)
+
+    merge_point_cloud_nearby_points(mesh_object)
 
     emission_mat = create_emission_material(mesh_object)
 
     add_geometry_nodes(mesh_object, emission_mat)
-    
-    merge_point_cloud_nearby_points(mesh_object)
 
 class BlenderExporterForColmap(bpy.types.Operator, ExportHelper):
 
