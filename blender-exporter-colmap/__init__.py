@@ -462,6 +462,9 @@ class BlenderExporterForColmap(bpy.types.Operator, ExportHelper):
 
         create_point_cloud_after_accumulation(vertices, colors)
         
+        point_cloud_path = os.path.join(output_dir, 'points3D.ply')
+        bpy.ops.wm.ply_export(filepath=point_cloud_path, export_selected_objects=True, apply_modifiers=False)
+
         write_model(cameras, images, {}, str(output_dir), output_format)
         yield 100.0
 
