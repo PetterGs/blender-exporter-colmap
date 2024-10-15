@@ -279,31 +279,6 @@ def merge_point_cloud_nearby_points_array(vertices: list[np.ndarray], colors: li
     # Convert back to lists for compatibility with other functions
     return new_vertices, new_colors
 
-def accumulate_points_from_image(depth_map_path: str, rgb_map_path: str, camera: bpy.types.Object, vertices: list, colors: list) -> None:
-    """Accumulates points and colors from a depth and RGB image projected from the camera into shared lists."""
-    
-    # Load depth and RGB data
-    depth_array, rgb_array, render_width, render_height = load_depth_and_rgb(depth_map_path, rgb_map_path)
-
-    # Iterate over every pixel and project to the camera plane
-    for y in range(render_height):
-        for x in range(render_width):
-            # Get the depth for the current pixel
-            z_depth = depth_array[y, x]
-
-            # Skip pixels with no valid depth data
-            if z_depth == 0 or z_depth >= camera.data.clip_end:
-                continue
-
-            # Project the pixel to 3D coordinates on the camera's projection plane
-            point_3d = screen_to_camera_plane(x, y, z_depth, camera, render_width, render_height)
-            vertices.append(point_3d)
-
-            # Get the RGB values for this pixel and store them
-            rgb = rgb_array[y, x]
-            colors.append(rgb)
-
-
 def create_point_cloud_after_accumulation(vertices: list, colors: list) -> bpy.types.Object:
     """Creates the point cloud mesh after all points have been accumulated."""
 
