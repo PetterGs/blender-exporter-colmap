@@ -7,13 +7,9 @@ import mathutils
 from mathutils import Vector
 from . ext.read_write_model import write_model, Camera, Image
 from bpy_extras.io_utils import ExportHelper
-from mathutils.bvhtree import BVHTree
 from bpy.props import StringProperty
 from bpy.types import CompositorNodeOutputFile
 import random
-
-import bmesh
-from bmesh.types import BMEdge, BMesh
 
 bl_info = {
     "name": "Scene exporter for colmap",
@@ -27,7 +23,6 @@ bl_info = {
     "tracker_url": "https://github.com/ohayoyogi/blender-exporter-colmap/issues",
     "category": "Import-Export"
 }
-
 
 def load_depth_and_rgb(depth_map_path: str, rgb_map_path: str) -> tuple[np.ndarray, np.ndarray, int, int]:
     """Loads depth and RGB data from EXR files."""
@@ -71,27 +66,6 @@ def screen_to_camera_plane(x: float, y: float, z_depth: float, cam: bpy.types.Ob
     world_coords = cam.matrix_world @ camera_coords
 
     return world_coords
-
-def create_point_cloud(vertices: list[tuple[float, float, float]], colors: list[tuple[float, float, float]]) -> bpy.types.Object:
-    """Creates a point cloud mesh from vertices and assigns colors using color attributes."""
-    
-    # Create a new mesh and object
-    mesh_data = bpy.data.meshes.new("PointCloud")
-    mesh_object = bpy.data.objects.new("PointCloud", mesh_data)
-    bpy.context.scene.collection.objects.link(mesh_object)
-
-    # Add vertices to the mesh (no faces for point cloud)
-    mesh_data.from_pydata(vertices, [], [])
-    mesh_data.update()
-
-    color_layer = mesh_data.color_attributes.new(name="Col", type='BYTE_COLOR', domain='POINT')
-
-    # Assign colors to the vertices (which are points in this case)
-    for i, vertex in enumerate(mesh_data.vertices):
-        r, g, b = colors[i]  # Get the color for the current vertex
-        color_layer.data[i].color = (r, g, b, 1.0)
-        
-    return mesh_object
 
 def add_geometry_nodes(mesh_object, material):
 
@@ -154,145 +128,146 @@ def create_emission_material(mesh_object: bpy.types.Object) -> None:
 
     return mat
 
-def accumulate_points_from_image(depth_map_path: str, rgb_map_path: str, camera: bpy.types.Object, vertices: list, colors: list) -> None:
-    """Accumulates points and colors from a depth and RGB image projected from the camera into shared lists."""
-    
-    # Load depth and RGB data
-    depth_array, rgb_array, render_width, render_height = load_depth_and_rgb(depth_map_path, rgb_map_path)
+class UnprunedPoints:
+    def __init__(self, depth_images: list[str], color_images: list[str], cameras: list[bpy.types.Object]):
+        """
+        Initializes the UnprunedPoints object by accumulating points from the provided
+        depth images, color images, and cameras.
+        
+        :param depth_images: List of file paths to depth images (EXR format)
+        :param color_images: List of file paths to color images (JPG format)
+        :param cameras: List of Blender camera objects corresponding to the images
+        """
+        self.vertices = []
+        self.colors = []
 
-    # Iterate over every pixel and project to the camera plane
-    for y in range(render_height):
-        for x in range(render_width):
-            # Get the depth for the current pixel
-            z_depth = depth_array[y, x]
+        # Ensure the number of depth images, color images, and cameras match
+        if len(depth_images) != len(color_images) or len(depth_images) != len(cameras):
+            raise ValueError("Mismatch in number of depth images, color images, and cameras.")
 
-            # Skip pixels with no valid depth data
-            if z_depth == 0 or z_depth >= camera.data.clip_end:
-                continue
+        # Accumulate points from the depth and color images using the provided cameras
+        for depth_image_path, color_image_path, cam in zip(depth_images, color_images, cameras):
+            self.accumulate_from_image(depth_image_path, color_image_path, cam)
 
-            # Project the pixel to 3D coordinates on the camera's projection plane
-            point_3d = screen_to_camera_plane(x, y, z_depth, camera, render_width, render_height)
-            vertices.append(point_3d)
+    def add_point(self, vertex: np.ndarray, color: np.ndarray):
+        """Adds a vertex and its corresponding color."""
+        self.vertices.append(vertex)
+        self.colors.append(color)
 
-            # Get the RGB values for this pixel and store them
-            rgb = rgb_array[y, x]
-            colors.append(rgb)
+    def accumulate_from_image(self, depth_map_path: str, rgb_map_path: str, camera: bpy.types.Object):
+        """Accumulates points and colors from a depth and RGB image projected from the camera into shared lists."""
+        depth_array, rgb_array, render_width, render_height = load_depth_and_rgb(depth_map_path, rgb_map_path)
 
-def get_bounding_box(mesh_object):
-    """Returns the min and max coordinates of the mesh's bounding box."""
-    vertices = [v.co for v in mesh_object.data.vertices]
-    min_bound = Vector((min(v.x for v in vertices), 
-                        min(v.y for v in vertices), 
-                        min(v.z for v in vertices)))
-    max_bound = Vector((max(v.x for v in vertices), 
-                        max(v.y for v in vertices), 
-                        max(v.z for v in vertices)))
-    return min_bound, max_bound
-
-def hash_point(point, min_bound, grid_resolution, cell_size):
-    """Converts a 3D point into a grid cell coordinate based on the bounding box and grid resolution."""
-    relative_pos = point - min_bound  # Shift point relative to bounding box min corner
-    return (int(relative_pos.x // cell_size.x),
-            int(relative_pos.y // cell_size.y),
-            int(relative_pos.z // cell_size.z))
-
-def randomize_order(vertices: list, colors: list) -> tuple:
-    """Randomizes the order of vertices and their corresponding colors."""
-    combined = list(zip(vertices, colors))  # Combine vertices and colors to keep their correspondence
-    random.shuffle(combined)  # Shuffle the combined list
-    vertices, colors = zip(*combined)  # Unzip back into separate lists
-    return list(vertices), list(colors)
-
-def merge_point_cloud_nearby_points_array(vertices: list[np.ndarray], colors: list[np.ndarray], grid_resolution: int = 128, distance_threshold: float = 0.01) -> tuple[list[np.ndarray], list[np.ndarray]]:
-    """Updates the point cloud arrays with merged vertices and colors using grid-based spatial hashing."""
-    
-    # Convert vertices to numpy array for vectorized operations
-    vertices = np.array(vertices)
-    colors = np.array(colors)
-    
-    # Get bounding box of the point cloud
-    min_bound = np.min(vertices, axis=0)
-    max_bound = np.max(vertices, axis=0)
-    
-    # Calculate the size of the bounding box in each dimension
-    box_size = max_bound - min_bound
-
-    # Calculate cell size based on grid resolution
-    cell_size = box_size / grid_resolution
-
-    # Create the spatial hash grid
-    grid = {}
-
-    # Populate the grid with points
-    for i, vertex in enumerate(vertices):
-        cell = tuple(((vertex - min_bound) // cell_size).astype(int))  # Convert to grid cell coordinates
-        if cell not in grid:
-            grid[cell] = []
-        grid[cell].append(i)
-
-    # Store indices of points to delete later
-    to_delete = set()
-
-    new_vertices = []
-    new_colors = []
-
-    def get_nearby_cells(cell):
-        """Function to get neighboring grid cells (3x3x3 surrounding cells)."""
-        for dx in range(-1, 2):
-            for dy in range(-1, 2):
-                for dz in range(-1, 2):
-                    yield (cell[0] + dx, cell[1] + dy, cell[2] + dz)
-
-    # Loop over all points and compare to find nearby ones
-    for i, vertex in enumerate(vertices):
-        if i in to_delete:
-            continue  # Skip points marked for deletion
-
-        cell = tuple(((vertex - min_bound) // cell_size).astype(int))
-        mean_location = vertex.copy()
-        mean_color = colors[i].copy()
-
-        nearby_points = [i]  # Include the current point itself
-        nearby_color_sum = mean_color.copy()
-
-        # Look for nearby points in the surrounding cells
-        for nearby_cell in get_nearby_cells(cell):
-            if nearby_cell not in grid:
-                continue
-            for j in grid[nearby_cell]:
-                if j == i or j in to_delete:
+        for y in range(render_height):
+            for x in range(render_width):
+                z_depth = depth_array[y, x]
+                if z_depth == 0 or z_depth >= camera.data.clip_end:
                     continue
-                if np.linalg.norm(vertices[i] - vertices[j]) <= distance_threshold:
-                    nearby_points.append(j)
-                    mean_location += vertices[j]
-                    nearby_color_sum += colors[j]
 
-                    to_delete.add(j)
+                point_3d = screen_to_camera_plane(x, y, z_depth, camera, render_width, render_height)
+                rgb = rgb_array[y, x]
+                self.add_point(point_3d, rgb)
 
-        if len(nearby_points) > 1:
-            mean_location /= len(nearby_points)
-            mean_color = nearby_color_sum / len(nearby_points)
+    def randomize(self):
+        """Randomizes the order of vertices and their corresponding colors."""
+        combined = list(zip(self.vertices, self.colors))
+        random.shuffle(combined)
+        self.vertices, self.colors = zip(*combined)
+        self.vertices = list(self.vertices)
+        self.colors = list(self.colors)
 
-        new_vertices.append(mean_location)
-        new_colors.append(mean_color)
+    def merge_nearby_points(self, grid_resolution: int = 128, distance_threshold: float = 0.01):
+        """Merges nearby points using grid-based spatial hashing."""
+        vertices = np.array(self.vertices)
+        colors = np.array(self.colors)
+        
+        min_bound = np.min(vertices, axis=0)
+        max_bound = np.max(vertices, axis=0)
+        box_size = max_bound - min_bound
+        cell_size = box_size / grid_resolution
+        grid = {}
 
-    # Convert back to lists for compatibility with other functions
-    return new_vertices, new_colors
+        for i, vertex in enumerate(vertices):
+            cell = tuple(((vertex - min_bound) // cell_size).astype(int))
+            if cell not in grid:
+                grid[cell] = []
+            grid[cell].append(i)
 
-def create_point_cloud_after_accumulation(vertices: list, colors: list) -> bpy.types.Object:
-    """Creates the point cloud mesh after all points have been accumulated."""
+        to_delete = set()
+        new_vertices = []
+        new_colors = []
 
-    vertices, colors = randomize_order(vertices, colors)
-    
-    vertices, colors = merge_point_cloud_nearby_points_array(vertices, colors)
+        def get_nearby_cells(cell):
+            for dx in range(-1, 2):
+                for dy in range(-1, 2):
+                    for dz in range(-1, 2):
+                        yield (cell[0] + dx, cell[1] + dy, cell[2] + dz)
 
-    point_cloud = create_point_cloud(vertices, colors)
+        for i, vertex in enumerate(vertices):
+            if i in to_delete:
+                continue
 
-    emission_mat = create_emission_material(point_cloud)
+            cell = tuple(((vertex - min_bound) // cell_size).astype(int))
+            mean_location = vertex.copy()
+            mean_color = colors[i].copy()
 
-    add_geometry_nodes(point_cloud, emission_mat)
-    
-    return point_cloud
+            nearby_points = [i]
+            nearby_color_sum = mean_color.copy()
+
+            for nearby_cell in get_nearby_cells(cell):
+                if nearby_cell not in grid:
+                    continue
+                for j in grid[nearby_cell]:
+                    if j == i or j in to_delete:
+                        continue
+                    if np.linalg.norm(vertices[i] - vertices[j]) <= distance_threshold:
+                        nearby_points.append(j)
+                        mean_location += vertices[j]
+                        nearby_color_sum += colors[j]
+                        to_delete.add(j)
+
+            if len(nearby_points) > 1:
+                mean_location /= len(nearby_points)
+                mean_color = nearby_color_sum / len(nearby_points)
+
+            new_vertices.append(mean_location)
+            new_colors.append(mean_color)
+
+        self.vertices = new_vertices
+        self.colors = new_colors
+
+    def create_point_cloud(self) -> bpy.types.Object:
+        """Converts the stored vertices and colors into a point cloud."""
+
+
+        point_cloud = self.create_point_cloud_object(self.vertices, self.colors)
+
+        emission_mat = create_emission_material(point_cloud)
+
+        add_geometry_nodes(point_cloud, emission_mat)
+        
+        return point_cloud
+
+    def create_point_cloud_object(self, vertices: list[tuple[float, float, float]], colors: list[tuple[float, float, float]]) -> bpy.types.Object:
+        """Creates a point cloud mesh from vertices and assigns colors using color attributes."""
+        
+        # Create a new mesh and object
+        mesh_data = bpy.data.meshes.new("PointCloud")
+        mesh_object = bpy.data.objects.new("PointCloud", mesh_data)
+        bpy.context.scene.collection.objects.link(mesh_object)
+
+        # Add vertices to the mesh (no faces for point cloud)
+        mesh_data.from_pydata(vertices, [], [])
+        mesh_data.update()
+
+        color_layer = mesh_data.color_attributes.new(name="Col", type='BYTE_COLOR', domain='POINT')
+
+        # Assign colors to the vertices (which are points in this case)
+        for i, vertex in enumerate(mesh_data.vertices):
+            r, g, b = colors[i]  # Get the color for the current vertex
+            color_layer.data[i].color = (r, g, b, 1.0)
+            
+        return mesh_object
 
 class BlenderExporterForColmap(bpy.types.Operator, ExportHelper):
 
@@ -415,21 +390,24 @@ class BlenderExporterForColmap(bpy.types.Operator, ExportHelper):
                     full_path = os.path.join(root, file)
                     temp_exr_files.append(full_path)
 
-        # Initialize shared lists for vertices and colors
-        vertices = []
-        colors = []
+        # List of depth image paths and color image paths
+        depth_images = [next((i for i in temp_exr_files if f"{cam.name_full}_depth" in i), None) for cam in sorted_cameras]
+        color_images = [os.path.join(images_dir, f'{cam.name_full}.jpg') for cam in sorted_cameras]
 
-        for idx, cam in enumerate(sorted_cameras):
-            camera_id = idx+1
-            depth_map_file = next((i for i in temp_exr_files if f"{cam.name_full}_depth" in i), None)
-            rgb_map_file = os.path.join(images_dir, f'{cam.name_full}.jpg') 
-            if depth_map_file is None:
-                continue  
+        # Remove None entries from depth_images and color_images
+        depth_images = [img for img in depth_images if img is not None]
+        color_images = [color_images[i] for i in range(len(depth_images))]  # Ensure lists stay in sync
 
-            # Accumulate points and colors from the current image
-            accumulate_points_from_image(depth_map_file, rgb_map_file, cam, vertices, colors)
+        # Initialize UnprunedPoints with depth and color images and corresponding cameras
+        unpruned_points = UnprunedPoints(depth_images, color_images, sorted_cameras)
 
-        create_point_cloud_after_accumulation(vertices, colors)
+        # Randomize point order
+        unpruned_points.randomize()
+
+        # Merge nearby points
+        unpruned_points.merge_nearby_points()
+
+        unpruned_points.create_point_cloud()
         
         point_cloud_path = os.path.join(output_dir, 'points3D.ply')
         bpy.ops.wm.ply_export(filepath=point_cloud_path, export_selected_objects=True, apply_modifiers=False)
