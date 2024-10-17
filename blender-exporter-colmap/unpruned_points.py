@@ -109,25 +109,36 @@ def create_emission_material(mesh_object: bpy.types.Object) -> None:
     return mat
 
 class UnprunedPoints:
-    def __init__(self, depth_images: list[str], color_images: list[str], cameras: list[bpy.types.Object]):
+    def __init__(self, depth_images: list[str], color_images: list[str], cameras: list[bpy.types.Object], grid_resolution: int = 128, distance_threshold: float = 0.01):
         """
         Initializes the UnprunedPoints object by accumulating points from the provided
-        depth images, color images, and cameras.
+        depth images, color images, and cameras, while performing the merge after each accumulation.
         
         :param depth_images: List of file paths to depth images (EXR format)
         :param color_images: List of file paths to color images (JPG format)
         :param cameras: List of Blender camera objects corresponding to the images
+        :param grid_resolution: Grid resolution for merging points
+        :param distance_threshold: Distance threshold for merging nearby points
         """
         self.vertices = []
         self.colors = []
+        self.grid_resolution = grid_resolution
+        self.distance_threshold = distance_threshold
+        self.accumulated_images_total = 0
 
         # Ensure the number of depth images, color images, and cameras match
         if len(depth_images) != len(color_images) or len(depth_images) != len(cameras):
             raise ValueError("Mismatch in number of depth images, color images, and cameras.")
 
-        # Accumulate points from the depth and color images using the provided cameras
+        # Accumulate and merge points from each depth and color image using the provided cameras
         for depth_image_path, color_image_path, cam in zip(depth_images, color_images, cameras):
             self.accumulate_from_image(depth_image_path, color_image_path, cam)
+
+            if self.accumulated_images_total < 2:
+                continue
+
+            self.randomize()
+            self.merge_nearby_points()
 
     def add_point(self, vertex: np.ndarray, color: np.ndarray):
         """Adds a vertex and its corresponding color."""
@@ -148,6 +159,8 @@ class UnprunedPoints:
                 rgb = rgb_array[y, x]
                 self.add_point(point_3d, rgb)
 
+        self.accumulated_images_total += 1
+
     def randomize(self):
         """Randomizes the order of vertices and their corresponding colors."""
         combined = list(zip(self.vertices, self.colors))
@@ -156,7 +169,7 @@ class UnprunedPoints:
         self.vertices = list(self.vertices)
         self.colors = list(self.colors)
 
-    def merge_nearby_points(self, grid_resolution: int = 128, distance_threshold: float = 0.01):
+    def merge_nearby_points(self):
         """Merges nearby points using grid-based spatial hashing."""
         vertices = np.array(self.vertices)
         colors = np.array(self.colors)
@@ -164,7 +177,7 @@ class UnprunedPoints:
         min_bound = np.min(vertices, axis=0)
         max_bound = np.max(vertices, axis=0)
         box_size = max_bound - min_bound
-        cell_size = box_size / grid_resolution
+        cell_size = box_size / self.grid_resolution
         grid = {}
 
         for i, vertex in enumerate(vertices):
@@ -200,7 +213,7 @@ class UnprunedPoints:
                 for j in grid[nearby_cell]:
                     if j == i or j in to_delete:
                         continue
-                    if np.linalg.norm(vertices[i] - vertices[j]) <= distance_threshold:
+                    if np.linalg.norm(vertices[i] - vertices[j]) <= self.distance_threshold:
                         nearby_points.append(j)
                         mean_location += vertices[j]
                         nearby_color_sum += colors[j]

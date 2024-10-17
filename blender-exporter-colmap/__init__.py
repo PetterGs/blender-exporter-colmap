@@ -154,12 +154,6 @@ class BlenderExporterForColmap(bpy.types.Operator, ExportHelper):
         # Initialize UnprunedPoints with depth and color images and corresponding cameras
         unpruned_points = UnprunedPoints(depth_images, color_images, sorted_cameras)
 
-        # Randomize point order
-        unpruned_points.randomize()
-
-        # Merge nearby points
-        unpruned_points.merge_nearby_points()
-
         unpruned_points.create_point_cloud()
         
         point_cloud_path = os.path.join(output_dir, 'points3D.ply')
