@@ -86,6 +86,33 @@ def is_in_frustum(point_3d: np.ndarray, camera: bpy.types.Object, width: int, he
     # If all checks pass, the point is inside the frustum
     return True
 
+def calculate_pixel_radius(z_depth: float, cam: Object, width: int, height: int) -> float:
+    """
+    Calculates the Euclidean radius of a pixel in the image plane based on its depth (z value).
+    This is the distance to an adjacent pixel, assuming both have the same depth.
+    
+    :param z_depth: Depth of the pixel in 3D space.
+    :param cam: Camera object.
+    :param width: Width of the image.
+    :param height: Height of the image.
+    :return: Euclidean radius of the pixel.
+    """
+    # Field of view and aspect ratio
+    half_fov = cam.data.angle / 2
+    aspect_ratio = width / height
+    
+    # Calculate the horizontal and vertical distances between adjacent pixels at this depth
+    tan_half_fov = math.tan(half_fov)
+    near_height = tan_half_fov * z_depth
+    near_width = near_height * aspect_ratio
+
+    # Calculate the pixel size in the x and y directions at the given depth
+    pixel_width = (2 * near_width) / width
+    pixel_height = (2 * near_height) / height
+
+    # Return the Euclidean distance between adjacent pixels (hypotenuse)
+    return math.sqrt(pixel_width**2 + pixel_height**2)
+
 def add_geometry_nodes(mesh_object, material):
 
     bpy.ops.object.select_all(action='DESELECT')
@@ -164,7 +191,9 @@ class UnprunedPoints:
         self.colors = []
         """The colors of the points."""
         self.frustum_cameras = []
-        """The indices of the cameras of which the point is visible withing the frustum."""
+        """The indices of the cameras of which the point is visible within the frustum."""
+        self.radii = []
+        """The Euclidean radius of each point based on depth (z value)."""
 
         self.grid_resolution = grid_resolution
         """The grid resolution for merging points."""
@@ -187,11 +216,12 @@ class UnprunedPoints:
             self.randomize()
             self.merge_nearby_points()
 
-    def add_point(self, vertex: np.ndarray, color: np.ndarray, frustum_cameras: list[int]):
-        """Adds a vertex, its corresponding color, and the list of frustum cameras."""
+    def add_point(self, vertex: np.ndarray, color: np.ndarray, frustum_cameras: list[int], radius: float):
+        """Adds a vertex, its corresponding color, the list of frustum cameras, and its radius."""
         self.vertices.append(vertex)
         self.colors.append(color)
         self.frustum_cameras.append(frustum_cameras)
+        self.radii.append(radius)
 
     def accumulate_from_image(self, depth_map_path: str, rgb_map_path: str, camera: Object, cameras: list[Object]):
         """Accumulates points and colors from a depth and RGB image projected from the camera into shared lists."""
@@ -206,6 +236,9 @@ class UnprunedPoints:
                 point_3d = screen_to_camera_plane(x, y, z_depth, camera, render_width, render_height)
                 rgb = rgb_array[y, x]
 
+                # Calculate the Euclidean radius for this point based on its depth
+                radius = calculate_pixel_radius(z_depth, camera, render_width, render_height)
+
                 # Check which cameras' frustums contain this point
                 frustum_cameras = []
                 for index, cam in enumerate(cameras):
@@ -215,25 +248,27 @@ class UnprunedPoints:
                     if is_in_frustum(point_3d, cam, render_width, render_height):
                         frustum_cameras.append(index)
 
-                self.add_point(point_3d, rgb, frustum_cameras)
+                self.add_point(point_3d, rgb, frustum_cameras, radius)
 
         self.accumulated_images_total += 1
 
     def randomize(self):
-        """Randomizes the order of vertices, colors, and frustum cameras."""
-        combined = list(zip(self.vertices, self.colors, self.frustum_cameras))
+        """Randomizes the order of vertices, colors, frustum cameras, and radii."""
+        combined = list(zip(self.vertices, self.colors, self.frustum_cameras, self.radii))
         random.shuffle(combined)
-        self.vertices, self.colors, self.frustum_cameras = zip(*combined)
+        self.vertices, self.colors, self.frustum_cameras, self.radii = zip(*combined)
         self.vertices = list(self.vertices)
         self.colors = list(self.colors)
         self.frustum_cameras = list(self.frustum_cameras)
+        self.radii = list(self.radii)
 
     def merge_nearby_points(self):
-        """Merges nearby points using grid-based spatial hashing and combines frustum_cameras for merged points."""
+        """Merges nearby points using grid-based spatial hashing and combines frustum_cameras and radii for merged points."""
         vertices = np.array(self.vertices)
         colors = np.array(self.colors)
         frustum_cameras = self.frustum_cameras  # No need to convert to a numpy array
-        
+        radii = np.array(self.radii)
+
         min_bound = np.min(vertices, axis=0)
         max_bound = np.max(vertices, axis=0)
         box_size = max_bound - min_bound
@@ -250,6 +285,7 @@ class UnprunedPoints:
         new_vertices = []
         new_colors = []
         new_frustum_cameras = []
+        new_radii = []
 
         def get_nearby_cells(cell):
             for dx in range(-1, 2):
@@ -265,6 +301,7 @@ class UnprunedPoints:
             mean_location = vertex.copy()
             mean_color = colors[i].copy()
             combined_frustum_cameras = set(frustum_cameras[i])  # Combine frustum cameras as a set to avoid duplicates
+            smallest_radius = radii[i]
 
             nearby_points = [i]
             nearby_color_sum = mean_color.copy()
@@ -275,11 +312,22 @@ class UnprunedPoints:
                 for j in grid[nearby_cell]:
                     if j == i or j in to_delete:
                         continue
-                    if np.linalg.norm(vertices[i] - vertices[j]) <= self.distance_threshold:
+
+                     # Check if the two points share any cameras in their frustum
+                    common_frustums = combined_frustum_cameras.intersection(frustum_cameras[j])
+                    if not common_frustums:
+                        continue  # Early exit: no shared frustums, skip merging
+
+                    current_smallest = smallest_radius
+                    if radii[j] < current_smallest:
+                        current_smallest = radii[j]
+                    distance = np.linalg.norm(vertices[i] - vertices[j])
+                    if distance <= current_smallest:
                         nearby_points.append(j)
                         mean_location += vertices[j]
                         nearby_color_sum += colors[j]
                         combined_frustum_cameras.update(frustum_cameras[j])  # Combine frustum cameras
+                        smallest_radius = current_smallest
                         to_delete.add(j)
 
             if len(nearby_points) > 1:
@@ -289,15 +337,17 @@ class UnprunedPoints:
             new_vertices.append(mean_location)
             new_colors.append(mean_color)
             new_frustum_cameras.append(list(combined_frustum_cameras))  # Store merged frustum cameras
+            new_radii.append(smallest_radius)
 
         self.vertices = new_vertices
         self.colors = new_colors
         self.frustum_cameras = new_frustum_cameras
+        self.radii = new_radii
 
     def create_point_cloud(self) -> Object:
         """Converts the stored vertices and colors into a point cloud."""
 
-        point_cloud = self.create_point_cloud_object(self.vertices, self.colors, self.frustum_cameras)
+        point_cloud = self.create_point_cloud_object(self.vertices, self.colors)
 
         emission_mat = create_emission_material(point_cloud)
 
@@ -326,35 +376,35 @@ class UnprunedPoints:
             
         return mesh_object
     
-    def create_point_cloud_object(self, vertices: list[tuple[float, float, float]], colors: list[tuple[float, float, float]], frustum_cameras: list[list[int]]) -> Object:
-        """Creates a point cloud mesh from vertices and assigns colors using color attributes."""
+    # def create_point_cloud_object(self, vertices: list[tuple[float, float, float]], colors: list[tuple[float, float, float]], frustum_cameras: list[list[int]]) -> Object:
+    #     """Creates a point cloud mesh from vertices and assigns colors using color attributes."""
         
-        # Create a new mesh and object
-        mesh_data = bpy.data.meshes.new("PointCloud")
-        mesh_object = bpy.data.objects.new("PointCloud", mesh_data)
-        bpy.context.scene.collection.objects.link(mesh_object)
+    #     # Create a new mesh and object
+    #     mesh_data = bpy.data.meshes.new("PointCloud")
+    #     mesh_object = bpy.data.objects.new("PointCloud", mesh_data)
+    #     bpy.context.scene.collection.objects.link(mesh_object)
 
-        allowed_camera_index = 2
+    #     allowed_camera_index = 2
 
-        filtered_vertices = []
-        filtered_colors = []
+    #     filtered_vertices = []
+    #     filtered_colors = []
 
-        for i, vertex in enumerate(vertices):
-            camera_indices = frustum_cameras[i]
-            if allowed_camera_index in camera_indices:
-                filtered_vertices.append(vertices[i])
-                filtered_colors.append(colors[i])
+    #     for i, vertex in enumerate(vertices):
+    #         camera_indices = frustum_cameras[i]
+    #         if allowed_camera_index in camera_indices:
+    #             filtered_vertices.append(vertices[i])
+    #             filtered_colors.append(colors[i])
 
-        # Add vertices to the mesh (no faces for point cloud)
-        mesh_data.from_pydata(filtered_vertices, [], [])
-        mesh_data.update()
+    #     # Add vertices to the mesh (no faces for point cloud)
+    #     mesh_data.from_pydata(filtered_vertices, [], [])
+    #     mesh_data.update()
 
-        color_layer = mesh_data.color_attributes.new(name="Col", type='BYTE_COLOR', domain='POINT')
+    #     color_layer = mesh_data.color_attributes.new(name="Col", type='BYTE_COLOR', domain='POINT')
 
-        # Assign colors to the vertices (which are points in this case)
-        for i, vertex in enumerate(mesh_data.vertices):
-            r, g, b = filtered_colors[i]  # Get the color for the current vertex
-            color_layer.data[i].color = (r, g, b, 1.0)
+    #     # Assign colors to the vertices (which are points in this case)
+    #     for i, vertex in enumerate(mesh_data.vertices):
+    #         r, g, b = filtered_colors[i]  # Get the color for the current vertex
+    #         color_layer.data[i].color = (r, g, b, 1.0)
             
-        return mesh_object
+    #     return mesh_object
 
